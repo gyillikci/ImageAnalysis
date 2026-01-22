@@ -1,0 +1,105 @@
+# Default configuration for Camera-IMU Calibration
+# Copy this file and modify as needed for your setup
+
+# MAVLink Connection Settings
+mavlink:
+  # Connection string for flight controller
+  # UDP: "udp:192.168.1.1:14550"
+  # Serial: "/dev/ttyACM0" or "COM3" on Windows
+  connection_string: "udp:127.0.0.1:14550"
+  baudrate: 115200
+
+# Camera Settings (Harrier or other UVC camera)
+camera:
+  # Device ID (integer) or device path
+  device_id: 0
+  width: 1280
+  height: 720
+  fps: 30
+
+  # Camera intrinsics (from calibration or estimated)
+  # fx, fy: Focal length in pixels
+  # cx, cy: Principal point (usually image center)
+  intrinsics:
+    fx: 800.0
+    fy: 800.0
+    cx: 640.0  # width / 2
+    cy: 360.0  # height / 2
+
+# Feature Tracking Settings
+feature_tracker:
+  max_features: 500
+  quality_level: 0.01
+  min_distance: 10
+  block_size: 7
+
+# Motion Estimator Settings
+motion_estimator:
+  ransac_threshold: 1.0
+  confidence: 0.99
+  min_features: 20
+
+# Temporal Synchronization Settings
+temporal_sync:
+  sample_rate: 60.0  # Hz for resampling
+  min_window_duration: 5.0  # seconds of data needed
+  max_window_duration: 30.0  # maximum correlation window
+
+  # Which gyro axis to use for correlation
+  # Options: 'p' (roll), 'q' (pitch), 'r' (yaw), 'all' (magnitude)
+  # 'p' is usually best for forward-facing cameras
+  use_axis: 'p'
+
+  # Butterworth filter for noise reduction
+  use_butterworth: true
+  butterworth_order: 2
+  butterworth_cutoff: 10.0  # Hz
+
+  # Convergence criteria
+  min_correlation: 0.5
+  convergence_threshold: 0.01  # seconds
+  convergence_samples: 5
+
+# Spatial Calibration Settings
+spatial_calibration:
+  min_samples: 100
+  max_samples: 1000
+
+  # Motion thresholds (rad/s)
+  # Samples with rates outside this range are ignored
+  min_angular_rate: 0.1
+  max_angular_rate: 3.0
+
+  # Initial guess for camera mount offset (degrees)
+  # Adjust based on your known mounting configuration
+  initial_offset:
+    yaw: 0.0
+    pitch: 0.0
+    roll: 0.0
+
+  # Optimizer settings
+  max_iterations: 100
+  convergence_threshold: 0.001  # rad
+
+# Calibration Duration Settings
+calibration:
+  min_duration: 10.0  # seconds
+  max_duration: 300.0  # seconds
+
+# Output Settings
+output:
+  # Default output filename (JSON)
+  result_file: "calibration_result.json"
+
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  log_level: INFO
+
+# Advanced Settings
+advanced:
+  # Buffer sizes
+  imu_buffer_size: 10000
+  frame_buffer_size: 100
+  motion_buffer_size: 1000
+
+  # Thread settings
+  use_threading: true
