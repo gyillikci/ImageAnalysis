@@ -30,10 +30,11 @@ class ConnectionType(Enum):
 class MAVLinkConfig:
     """MAVLink connection configuration."""
     connection_string: str = "udp:127.0.0.1:14550"
+    baudrate: int = 115200
     source_system: int = 255
     source_component: int = 0
     request_data_streams: bool = True
-    stream_rate_hz: int = 100
+    stream_rate_hz: int = 200  # Increased for Gyroflow (needs 200+ Hz)
     buffer_size_imu: int = 10000
     buffer_size_attitude: int = 5000
     buffer_size_gps: int = 1000
@@ -162,44 +163,15 @@ class MAVLinkReceiver:
 
         conn_str = self.config.connection_string
 
-        print(f"Connecting to MAVLink: {conn_str}")
+        print(f"Connecting to MAVLink: {conn_str} (baud={self.config.baudrate})")
 
-        # Parse connection string
-        if conn_str.startswith("udp:"):
-            # Format: udp:host:port or udpin:host:port
-            self._connection = mavutil.mavlink_connection(
-                conn_str,
-                source_system=self.config.source_system,
-                source_component=self.config.source_component
-            )
-        elif conn_str.startswith("serial:") or conn_str.startswith("/dev/"):
-            # Format: serial:/dev/ttyUSB0:57600 or /dev/ttyUSB0
-            if conn_str.startswith("serial:"):
-                parts = conn_str[7:].split(":")
-                device = parts[0]
-                baud = int(parts[1]) if len(parts) > 1 else 57600
-            else:
-                device = conn_str.split(":")[0]
-                baud = 57600
-            self._connection = mavutil.mavlink_connection(
-                device,
-                baud=baud,
-                source_system=self.config.source_system,
-                source_component=self.config.source_component
-            )
-        elif conn_str.startswith("tcp:"):
-            self._connection = mavutil.mavlink_connection(
-                conn_str,
-                source_system=self.config.source_system,
-                source_component=self.config.source_component
-            )
-        else:
-            # Try direct connection string
-            self._connection = mavutil.mavlink_connection(
-                conn_str,
-                source_system=self.config.source_system,
-                source_component=self.config.source_component
-            )
+        # pymavlink handles connection string parsing automatically
+        self._connection = mavutil.mavlink_connection(
+            conn_str,
+            baud=self.config.baudrate,
+            source_system=self.config.source_system,
+            source_component=self.config.source_component
+        )
 
         # Wait for heartbeat
         print("Waiting for heartbeat...")
@@ -213,6 +185,7 @@ class MAVLinkReceiver:
         # Request data streams
         if self.config.request_data_streams:
             self._request_data_streams()
+            self._request_high_rate_imu()
 
     def _disconnect(self) -> None:
         """Close MAVLink connection."""
@@ -273,6 +246,53 @@ class MAVLinkReceiver:
 
         print(f"Requested data streams at {rate} Hz")
 
+    def _request_high_rate_imu(self) -> None:
+        """Request high-rate IMU data using SET_MESSAGE_INTERVAL command.
+        
+        This uses MAVLink 2 COMMAND_LONG to set specific message intervals,
+        which can achieve higher rates than the legacy stream request method.
+        """
+        if not self._connection:
+            return
+        
+        from pymavlink import mavutil
+        
+        # Message IDs
+        # RAW_IMU = 27
+        # SCALED_IMU = 26  
+        # SCALED_IMU2 = 116
+        # HIGHRES_IMU = 105
+        
+        # Request interval in microseconds based on configured rate
+        # (5000us = 200Hz, 2500us = 400Hz, 1000us = 1000Hz)
+        rate = self.config.stream_rate_hz
+        interval_us = max(1000, 1000000 // rate)  # Min 1000us = 1000Hz max
+        
+        # Request HIGHRES_IMU for continuous high-rate data (preferred)
+        self._connection.mav.command_long_send(
+            self._connection.target_system,
+            self._connection.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,  # confirmation
+            105,  # HIGHRES_IMU message ID
+            interval_us,  # interval in microseconds
+            0, 0, 0, 0, 0  # unused params
+        )
+        
+        # Also request RAW_IMU as fallback
+        self._connection.mav.command_long_send(
+            self._connection.target_system,
+            self._connection.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,  # confirmation
+            27,  # RAW_IMU message ID
+            interval_us,  # interval in microseconds
+            0, 0, 0, 0, 0  # unused params
+        )
+        
+        actual_rate = 1000000 // interval_us
+        print(f"Requested high-rate IMU at {actual_rate} Hz (interval={interval_us}us)")
+
     def _receive_loop(self) -> None:
         """Main receive loop (runs in thread)."""
         while self._running:
@@ -301,8 +321,9 @@ class MAVLinkReceiver:
                 elif msg_type == 'RAW_IMU':
                     self._handle_raw_imu(msg, local_ts)
 
-                elif msg_type == 'SCALED_IMU' or msg_type == 'SCALED_IMU2':
-                    self._handle_scaled_imu(msg, local_ts)
+                # Skip SCALED_IMU messages - using only RAW_IMU for Gyroflow consistency
+                # elif msg_type == 'SCALED_IMU' or msg_type == 'SCALED_IMU2':
+                #     self._handle_scaled_imu(msg, local_ts)
 
                 elif msg_type == 'HIGHRES_IMU':
                     self._handle_highres_imu(msg, local_ts)

@@ -26,7 +26,7 @@ class TemporalSyncConfig:
     """Configuration for temporal synchronization."""
     # Correlation parameters
     sample_rate: float = 60.0  # Hz for resampling
-    min_window_duration: float = 5.0  # Minimum seconds of data needed
+    min_window_duration: float = 3.0  # Minimum seconds of data needed
     max_window_duration: float = 30.0  # Maximum window for correlation
 
     # Filter parameters
@@ -35,9 +35,9 @@ class TemporalSyncConfig:
     butterworth_cutoff: float = 10.0  # Hz
 
     # Convergence parameters
-    min_correlation: float = 0.5  # Minimum correlation coefficient
-    convergence_threshold: float = 0.01  # Seconds - offset must stabilize within this
-    convergence_samples: int = 5  # Number of consistent estimates needed
+    min_correlation: float = 0.3  # Minimum correlation coefficient (lowered for noisy data)
+    convergence_threshold: float = 0.02  # Seconds - offset must stabilize within this
+    convergence_samples: int = 3  # Number of consistent estimates needed
 
     # Search range
     max_time_offset: float = 2.0  # Maximum expected offset in seconds
@@ -46,7 +46,7 @@ class TemporalSyncConfig:
     update_interval: float = 1.0  # Seconds between sync attempts
 
     # Axis selection for correlation
-    use_axis: str = 'p'  # 'p', 'q', 'r', or 'all'
+    use_axis: str = 'r'  # 'p', 'q', 'r', or 'all' - use yaw by default
 
 
 @dataclass
@@ -89,10 +89,12 @@ class TemporalSynchronizer:
         """
         self.config = config
 
-        # Data buffers
-        buffer_size = int(config.max_window_duration * config.sample_rate * 2)
-        self._imu_buffer = TimestampedRingBuffer[IMUData](buffer_size)
-        self._motion_buffer = TimestampedRingBuffer[MotionEstimate](buffer_size)
+        # Data buffers - IMU can run at 200Hz+, so need larger buffer
+        # For 30s at 200Hz = 6000 samples
+        imu_buffer_size = int(config.max_window_duration * 250)  # Assume max 250Hz IMU
+        motion_buffer_size = int(config.max_window_duration * config.sample_rate * 2)
+        self._imu_buffer = TimestampedRingBuffer[IMUData](imu_buffer_size)
+        self._motion_buffer = TimestampedRingBuffer[MotionEstimate](motion_buffer_size)
 
         # State
         self._state = TemporalSyncState()
@@ -175,11 +177,16 @@ class TemporalSynchronizer:
 
             min_duration = self.config.min_window_duration
             if imu_duration < min_duration or motion_duration < min_duration:
+                # Debug: print buffer status
+                print(f"  [sync] Waiting: IMU={len(imu_data)} ({imu_duration:.1f}s), Motion={len(motion_data)} ({motion_duration:.1f}s), need {min_duration}s")
                 return
 
             # Compute correlation
             try:
                 offset, corr = self._compute_correlation(imu_data, motion_data)
+
+                # Debug: always print correlation result
+                print(f"  [sync] Correlation: {corr:.3f}, offset: {offset*1000:.1f}ms (threshold: {self.config.min_correlation})")
 
                 if corr < self.config.min_correlation:
                     return
@@ -307,8 +314,17 @@ class TemporalSynchronizer:
         # Compute cross-correlation
         ycorr = np.correlate(imu_filtered, motion_filtered, mode='full')
 
-        # Find peak
-        max_index = np.argmax(ycorr)
+        # Find peak (could be positive or negative correlation)
+        max_pos_index = np.argmax(ycorr)
+        max_neg_index = np.argmin(ycorr)  # Most negative = strongest negative correlation
+        
+        # Use whichever has larger absolute value
+        if abs(ycorr[max_pos_index]) >= abs(ycorr[max_neg_index]):
+            max_index = max_pos_index
+            sign = 1.0
+        else:
+            max_index = max_neg_index
+            sign = -1.0  # Signals are inverted
 
         # Convert to time shift
         # Need to account for correlation array indexing
@@ -323,10 +339,10 @@ class TemporalSynchronizer:
             self.config.max_time_offset
         )
 
-        # Compute correlation coefficient
-        if len(ycorr) > 0 and np.max(ycorr) > 0:
+        # Compute correlation coefficient (use absolute value)
+        if len(ycorr) > 0 and (np.max(np.abs(ycorr)) > 0):
             # Normalized correlation
-            corr = np.max(ycorr) / (len(motion_filtered) *
+            corr = np.max(np.abs(ycorr)) / (len(motion_filtered) *
                                      np.std(imu_filtered) *
                                      np.std(motion_filtered))
             corr = min(corr, 1.0)  # Cap at 1.0

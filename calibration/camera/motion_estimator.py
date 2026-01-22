@@ -25,10 +25,10 @@ from .feature_tracker import FeatureTracker
 class MotionEstimatorConfig:
     """Motion estimator configuration."""
     max_features: int = 500
-    min_features: int = 20
+    min_features: int = 10  # Lowered for more motion estimates
     quality_level: float = 0.01
     min_distance: int = 10
-    ransac_threshold: float = 1.0
+    ransac_threshold: float = 2.0  # Increased for more RANSAC inliers
     confidence: float = 0.99
     buffer_size: int = 1000
 
@@ -109,7 +109,7 @@ class MotionEstimator:
 
     def process_frame(self, frame_data: FrameData) -> MotionEstimate:
         """
-        Process a single frame and estimate motion.
+        Process a single frame and estimate motion using optical flow.
 
         Args:
             frame_data: Input frame data
@@ -137,68 +137,61 @@ class MotionEstimator:
             if dt <= 0:
                 return self._invalid_motion(timestamp, 0.0)
 
-            # Compute essential matrix
-            E, mask = cv2.findEssentialMat(
-                prev_feats.points,
-                curr_feats.points,
-                self._K,
-                method=cv2.RANSAC,
-                prob=self.config.confidence,
-                threshold=self.config.ransac_threshold
-            )
-
-            if E is None or E.shape != (3, 3):
-                return self._invalid_motion(timestamp, dt)
-
-            # Count inliers
-            if mask is not None:
-                inliers = np.sum(mask)
-                inlier_ratio = inliers / len(mask)
-            else:
-                inliers = len(prev_feats.points)
-                inlier_ratio = 1.0
-
-            if inlier_ratio < 0.3:
-                return self._invalid_motion(timestamp, dt)
-
-            # Recover rotation and translation
-            _, R, t, mask = cv2.recoverPose(
-                E,
-                prev_feats.points,
-                curr_feats.points,
-                self._K
-            )
-
-            if R is None:
-                return self._invalid_motion(timestamp, dt)
-
-            # Convert rotation matrix to Rodrigues vector
-            rvec, _ = cv2.Rodrigues(R)
-            rvec = rvec.flatten()
-
-            # Compute angular velocity (rotation divided by time)
-            omega = rvec / dt
+            # Get matched points
+            prev_pts = prev_feats.points
+            curr_pts = curr_feats.points
+            
+            # Compute optical flow
+            flow = curr_pts - prev_pts
+            
+            # Mean flow gives us pitch and yaw
+            mean_flow = np.mean(flow, axis=0)  # [dx, dy] in pixels per frame
+            
+            # omega_y (yaw) ≈ flow_x / (fx * dt)
+            # omega_x (pitch) ≈ -flow_y / (fy * dt)
+            omega_y = mean_flow[0] / (self.config.fx * dt)  # yaw rate
+            omega_x = -mean_flow[1] / (self.config.fy * dt)  # pitch rate
+            
+            # For roll (rotation about optical axis)
+            # Roll causes rotational flow pattern - pixels move in circles around center
+            # First, remove the translational component (mean flow) from each point
+            flow_centered = flow - mean_flow  # Remove translation to isolate rotation
+            
+            # Position vectors from image center
+            pos = prev_pts - np.array([self.config.cx, self.config.cy])
+            r_dist = np.sqrt(pos[:, 0]**2 + pos[:, 1]**2)
+            r_dist = np.maximum(r_dist, 10.0)  # Avoid division by zero
+            
+            # For pure roll, flow should be perpendicular to position vector
+            # Tangent direction at each point is (-y, x) / r (counter-clockwise)
+            tangent_x = -pos[:, 1] / r_dist
+            tangent_y = pos[:, 0] / r_dist
+            tangential = flow_centered[:, 0] * tangent_x + flow_centered[:, 1] * tangent_y
+            
+            # Angular velocity = tangential velocity / radius
+            omega_per_point = tangential / r_dist
+            omega_z = -np.median(omega_per_point) / dt  # roll rate (negated for IMU convention)
 
             # Angular rates in camera frame
-            # For a forward-facing camera:
-            # p (roll) ~ rotation around camera Z (optical axis)
-            # q (pitch) ~ rotation around camera X
-            # r (yaw) ~ rotation around camera Y
-            p = omega[2]  # Roll rate
-            q = omega[0]  # Pitch rate
-            r = -omega[1]  # Yaw rate (negated for NED convention)
+            p = omega_z   # Roll rate
+            q = omega_x   # Pitch rate
+            r = omega_y   # Yaw rate
+            
+            # Sanity check: cap maximum angular rate at 10 rad/s (~573 deg/s)
+            if max(abs(p), abs(q), abs(r)) > 10.0:
+                return self._invalid_motion(timestamp, dt)
 
             # Create motion estimate
             motion = MotionEstimate(
                 timestamp=timestamp,
                 dt=dt,
-                rotation=rvec,
-                translation=t.flatten() if t is not None else None,
+                rotation=np.array([p * dt, q * dt, r * dt]),  # Approximate rotation vector
+                translation=None,
                 p=p,
                 q=q,
                 r=r,
-                num_features=len(prev_feats.points),
-                inlier_ratio=inlier_ratio,
+                num_features=len(prev_pts),
+                inlier_ratio=1.0,
                 valid=True
             )
 
@@ -210,9 +203,6 @@ class MotionEstimator:
 
             # Fire callbacks
             self._fire_callbacks(motion)
-
-            # Update previous rotation
-            self._prev_R = R @ self._prev_R
 
             return motion
 

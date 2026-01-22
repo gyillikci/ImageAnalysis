@@ -64,7 +64,7 @@ class CalibrationApp:
             camera_id = int(camera_id)
 
         self.camera_config = CameraConfig(
-            device_id=camera_id,
+            device=camera_id,
             width=args.width,
             height=args.height,
             fps=args.fps
@@ -83,7 +83,9 @@ class CalibrationApp:
         self.temporal_config = TemporalSyncConfig(
             sample_rate=args.fps,
             min_window_duration=args.min_duration,
-            use_axis=args.sync_axis
+            use_axis=args.sync_axis,
+            min_correlation=0.3,  # Lower threshold for noisy data
+            convergence_samples=3  # Faster convergence
         )
 
         # Spatial calibration configuration
@@ -149,7 +151,7 @@ class CalibrationApp:
         self.spatial_calib.start()
 
         # Connect callbacks
-        self.mavlink.add_imu_callback(self.temporal_sync.on_imu_data)
+        self.mavlink.add_callback('imu', self.temporal_sync.on_imu_data)
 
         print("\nSetup complete!")
         print("=" * 60)
@@ -239,7 +241,7 @@ class CalibrationApp:
         # Camera status
         cam_status = self.camera.get_status()
         print(f"Camera: connected={cam_status['connected']}, "
-              f"fps={cam_status['actual_fps']:.1f}")
+              f"fps={cam_status['frame_rate']:.1f}")
 
         # Motion estimator status
         me_status = self.motion_estimator.get_status()

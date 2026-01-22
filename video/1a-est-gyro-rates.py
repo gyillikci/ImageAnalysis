@@ -24,7 +24,9 @@ affine_minpts = 7
 tol = 2.0
 
 parser = argparse.ArgumentParser(description='Estimate gyro biases from movie.')
-parser.add_argument('video', help='video file')
+parser.add_argument('video', nargs='?', help='video file (optional if --webcam is used)')
+parser.add_argument('--webcam', type=int, nargs='?', const=0, default=None,
+                    help='use webcam instead of video file (default: device 0)')
 parser.add_argument('--camera', help='select camera calibration file')
 parser.add_argument('--scale', type=float, default=1.0, help='scale input')
 parser.add_argument('--skip-frames', type=int, default=0, help='skip n initial frames')
@@ -34,17 +36,29 @@ parser.add_argument('--draw-masks', action='store_true', help='draw stabilizatio
 parser.add_argument('--write', action='store_true', help='write out the smoothed video')
 args = parser.parse_args()
 
-#file = args.video
+# Check for valid input source
+use_webcam = args.webcam is not None
+if not use_webcam and args.video is None:
+    parser.error("Either provide a video file or use --webcam")
+
 scale = args.scale
 skip_frames = args.skip_frames
 
-# pathname work
-abspath = os.path.abspath(args.video)
-filename, ext = os.path.splitext(abspath)
-dirname = os.path.dirname(args.video)
-output_csv = filename + ".csv"
-output_video = filename + "_smooth" + ext
-local_config = os.path.join(dirname, "camera.json")
+# pathname work and video initialization
+if use_webcam:
+    # Webcam mode
+    dirname = os.getcwd()
+    output_csv = os.path.join(dirname, "webcam_gyro.csv")
+    output_video = os.path.join(dirname, "webcam_smooth.mp4")
+    local_config = os.path.join(dirname, "camera.json")
+else:
+    # Video file mode
+    abspath = os.path.abspath(args.video)
+    filename, ext = os.path.splitext(abspath)
+    dirname = os.path.dirname(args.video)
+    output_csv = filename + ".csv"
+    output_video = filename + "_smooth" + ext
+    local_config = os.path.join(dirname, "camera.json")
 
 config = PropertyNode()
 
@@ -78,24 +92,49 @@ print('dist:', dist)
 K = K * args.scale
 K[2,2] = 1.0
 
-metadata = skvideo.io.ffprobe(args.video)
-#print(metadata.keys())
-print(json.dumps(metadata["video"], indent=4))
-fps_string = metadata['video']['@avg_frame_rate']
-(num, den) = fps_string.split('/')
-fps = float(num) / float(den)
-codec = metadata['video']['@codec_long_name']
-w = int(round(int(metadata['video']['@width']) * scale))
-h = int(round(int(metadata['video']['@height']) * scale))
-total_frames = int(round(float(metadata['video']['@duration']) * fps))
+# Initialize video source
+reader = None
+capture = None
 
-print('fps:', fps)
-print('codec:', codec)
-print('output size:', w, 'x', h)
-print('total frames:', total_frames)
+if use_webcam:
+    # Webcam initialization
+    print(f"Opening webcam device {args.webcam}...")
+    capture = cv2.VideoCapture(args.webcam, cv2.CAP_DSHOW)
+    if not capture.isOpened():
+        capture = cv2.VideoCapture(args.webcam)
+    if not capture.isOpened():
+        print(f"Error: Could not open webcam device {args.webcam}")
+        exit(1)
+    
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
+    h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
+    total_frames = -1  # Unknown for webcam
+    codec = "webcam"
+    
+    print(f'Webcam: {w}x{h} @ {fps:.2f} fps')
+else:
+    # Video file initialization
+    metadata = skvideo.io.ffprobe(args.video)
+    #print(metadata.keys())
+    print(json.dumps(metadata["video"], indent=4))
+    fps_string = metadata['video']['@avg_frame_rate']
+    (num, den) = fps_string.split('/')
+    fps = float(num) / float(den)
+    codec = metadata['video']['@codec_long_name']
+    w = int(round(int(metadata['video']['@width']) * scale))
+    h = int(round(int(metadata['video']['@height']) * scale))
+    total_frames = int(round(float(metadata['video']['@duration']) * fps))
 
-print("Opening ", args.video)
-reader = skvideo.io.FFmpegReader(args.video, inputdict={}, outputdict={})
+    print('fps:', fps)
+    print('codec:', codec)
+    print('output size:', w, 'x', h)
+    print('total frames:', total_frames)
+
+    print("Opening ", args.video)
+    reader = skvideo.io.FFmpegReader(args.video, inputdict={}, outputdict={})
 
 if args.write:
     inputdict = {
@@ -526,8 +565,22 @@ fieldnames=['frame', 'time', 'rotation (deg)',
 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 writer.writeheader()
 
-for frame in reader.nextFrame():
-    frame = frame[:,:,::-1]     # convert from RGB to BGR (to make opencv happy)
+# Frame generator function to handle both webcam and video file
+def get_frames():
+    if use_webcam:
+        while True:
+            ret, frame = capture.read()
+            if not ret:
+                break
+            yield frame
+    else:
+        for frame in reader.nextFrame():
+            frame = frame[:,:,::-1]     # convert from RGB to BGR
+            yield frame
+
+for frame in get_frames():
+    if not use_webcam:
+        pass  # Already converted in get_frames for video files
     counter += 1
 
     filtered = []
@@ -770,5 +823,10 @@ for frame in reader.nextFrame():
     if 0xFF & cv2.waitKey(5) == 27:
         break
 
+# Cleanup
+if capture is not None:
+    capture.release()
+if reader is not None:
+    reader.close()
 cv2.destroyAllWindows()
 

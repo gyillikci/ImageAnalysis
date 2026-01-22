@@ -3,19 +3,31 @@
 import argparse
 import csv
 import cv2
-import skvideo.io               # pip3 install sk-video
 import json
 from math import atan2, cos, pi, sin, sqrt
 import numpy as np
 import os
 import sys
 
+# Make skvideo optional (only needed for video files)
+try:
+    import skvideo.io
+    SKVIDEO_AVAILABLE = True
+except ImportError:
+    SKVIDEO_AVAILABLE = False
+
 from props import PropertyNode
 import props_json
 
-sys.path.append('../scripts')
-from lib import render4geotiff
-r = render4geotiff.Render()
+# Make render4geotiff optional
+try:
+    sys.path.append('../scripts')
+    from lib import render4geotiff
+    r = render4geotiff.Render()
+    RENDER_AVAILABLE = True
+except ImportError:
+    RENDER_AVAILABLE = False
+    r = None
 
 d2r = pi / 180.0
 r2d = 180.0 / pi
@@ -28,7 +40,9 @@ affine_minpts = 7
 tol = 2.0
 
 parser = argparse.ArgumentParser(description='Estimate gyro biases from movie.')
-parser.add_argument('video', help='video file')
+parser.add_argument('video', nargs='?', help='video file (optional if --webcam is used)')
+parser.add_argument('--webcam', type=int, nargs='?', const=0, default=None,
+                    help='use webcam instead of video file (default: device 0)')
 parser.add_argument('--camera', help='select camera calibration file')
 parser.add_argument('--scale', type=float, default=1.0, help='scale input')
 parser.add_argument('--skip-frames', type=int, default=0, help='skip n initial frames')
@@ -38,17 +52,27 @@ parser.add_argument('--draw-masks', action='store_true', help='draw stabilizatio
 parser.add_argument('--write-smooth', action='store_true', help='write out the smoothed video')
 args = parser.parse_args()
 
-#file = args.video
+# Check for valid input source
+use_webcam = args.webcam is not None
+if not use_webcam and args.video is None:
+    parser.error("Either provide a video file or use --webcam")
+
 scale = args.scale
 skip_frames = args.skip_frames
 
 # pathname work
-abspath = os.path.abspath(args.video)
-filename, ext = os.path.splitext(abspath)
-dirname = os.path.dirname(args.video)
-output_csv = filename + ".csv"
-output_avi = filename + "_smooth.avi"
-local_config = os.path.join(dirname, "camera.json")
+if use_webcam:
+    dirname = os.getcwd()
+    output_csv = os.path.join(dirname, "webcam_motion.csv")
+    output_avi = os.path.join(dirname, "webcam_smooth.avi")
+    local_config = os.path.join(dirname, "camera.json")
+else:
+    abspath = os.path.abspath(args.video)
+    filename, ext = os.path.splitext(abspath)
+    dirname = os.path.dirname(args.video)
+    output_csv = filename + ".csv"
+    output_avi = filename + "_smooth.avi"
+    local_config = os.path.join(dirname, "camera.json")
 
 config = PropertyNode()
 
@@ -82,24 +106,50 @@ print('dist:', dist)
 K = K * args.scale
 K[2,2] = 1.0
 
-metadata = skvideo.io.ffprobe(args.video)
-#print(metadata.keys())
-print(json.dumps(metadata["video"], indent=4))
-fps_string = metadata['video']['@avg_frame_rate']
-(num, den) = fps_string.split('/')
-fps = float(num) / float(den)
-codec = metadata['video']['@codec_long_name']
-w = int(round(int(metadata['video']['@width']) * scale))
-h = int(round(int(metadata['video']['@height']) * scale))
-total_frames = int(round(float(metadata['video']['@duration']) * fps))
+# Initialize video source
+reader = None
+capture = None
 
-print('fps:', fps)
-print('codec:', codec)
-print('output size:', w, 'x', h)
-print('total frames:', total_frames)
+if use_webcam:
+    print(f"Opening webcam device {args.webcam}...")
+    capture = cv2.VideoCapture(args.webcam, cv2.CAP_DSHOW)
+    if not capture.isOpened():
+        capture = cv2.VideoCapture(args.webcam)
+    if not capture.isOpened():
+        print(f"Error: Could not open webcam device {args.webcam}")
+        exit(1)
+    
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
+    h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
+    total_frames = -1
+    codec = "webcam"
+    
+    print(f'Webcam: {w}x{h} @ {fps:.2f} fps')
+else:
+    if not SKVIDEO_AVAILABLE:
+        print("Error: skvideo is required for video file input. Install with: pip install sk-video")
+        exit(1)
+    metadata = skvideo.io.ffprobe(args.video)
+    #print(metadata.keys())
+    print(json.dumps(metadata["video"], indent=4))
+    fps_string = metadata['video']['@avg_frame_rate']
+    (num, den) = fps_string.split('/')
+    fps = float(num) / float(den)
+    codec = metadata['video']['@codec_long_name']
+    w = int(round(int(metadata['video']['@width']) * scale))
+    h = int(round(int(metadata['video']['@height']) * scale))
+    total_frames = int(round(float(metadata['video']['@duration']) * fps))
 
-print("Opening ", args.video)
-reader = skvideo.io.FFmpegReader(args.video, inputdict={}, outputdict={})
+    print('fps:', fps)
+    print('codec:', codec)
+    print('output size:', w, 'x', h)
+    print('total frames:', total_frames)
+
+    print("Opening ", args.video)
+    reader = skvideo.io.FFmpegReader(args.video, inputdict={}, outputdict={})
 
 if args.write_smooth:
     #outfourcc = cv2.cv.CV_FOURCC('F', 'M', 'P', '4')
@@ -508,8 +558,20 @@ fieldnames=['frame', 'time', 'rotation (deg)',
 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 writer.writeheader()
 
-for frame in reader.nextFrame():
-    frame = frame[:,:,::-1]     # convert from RGB to BGR (to make opencv happy)
+# Frame generator function
+def get_frames():
+    if use_webcam:
+        while True:
+            ret, frame = capture.read()
+            if not ret:
+                break
+            yield frame
+    else:
+        for frame in reader.nextFrame():
+            frame = frame[:,:,::-1]     # convert from RGB to BGR
+            yield frame
+
+for frame in get_frames():
     counter += 1
 
     filtered = []
@@ -535,7 +597,7 @@ for frame in reader.nextFrame():
         frame_undist = cv2.undistort(frame_scale, K, np.array(dist))
     else:
         frame_undist = frame_scale
-    if not args.no_equalize:
+    if not args.no_equalize and RENDER_AVAILABLE and r is not None:
         frame_undist = r.aeq_value(frame_undist)
 
     # test for building up an automatic mask
@@ -748,5 +810,10 @@ for frame in reader.nextFrame():
     if 0xFF & cv2.waitKey(5) == 27:
         break
 
+# Cleanup
+if capture is not None:
+    capture.release()
+if reader is not None:
+    reader.close()
 cv2.destroyAllWindows()
 
