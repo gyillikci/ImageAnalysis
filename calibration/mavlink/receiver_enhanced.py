@@ -43,7 +43,8 @@ from mavlink.streaming import HighRateStreamer, StreamRateMonitor, MAVLinkMessag
 class EnhancedMAVLinkConfig:
     """Enhanced MAVLink receiver configuration."""
     # Connection
-    connection_string: str = "udp:127.0.0.1:14550"
+    connection_string: str = "/dev/ttyACM0"  # Default to serial (USB)
+    baudrate: int = 115200  # Serial baudrate (921600 for high-rate)
     source_system: int = 255
     source_component: int = 0
 
@@ -195,10 +196,14 @@ class EnhancedMAVLinkReceiver:
             raise ImportError("pymavlink required")
 
         conn_str = self.config.connection_string
-        print(f"Connecting to: {conn_str}")
+        print(f"Connecting to: {conn_str} (baud={self.config.baudrate})")
 
+        # pymavlink handles connection string parsing automatically
+        # For serial: /dev/ttyACM0, /dev/ttyUSB0, COM3, etc.
+        # For UDP: udp:host:port
         self._connection = mavutil.mavlink_connection(
             conn_str,
+            baud=self.config.baudrate,
             source_system=self.config.source_system,
             source_component=self.config.source_component
         )
